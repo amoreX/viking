@@ -1,212 +1,150 @@
-import db from "@/lib/db";
-import {
-  createGitHubClient,
-  fetchUserRepos,
-  fetchMergedPRs,
-  fetchPRFiles,
-  fetchPRDetail,
-} from "@/lib/github";
+import { supabase } from "@/lib/supabase";
+import { createGitHubClient, fetchUserRepos, fetchMergedPRs } from "@/lib/github";
 
-const GENERATED_FILE_PATTERNS = [
-  /^package-lock\.json$/,
-  /^yarn\.lock$/,
-  /^pnpm-lock\.yaml$/,
-  /(?:^|\/)(dist|build|\.next|node_modules|vendor)\//,
-  /\.min\.js$/,
-  /\.min\.css$/,
-  /\.snap$/,
-  /(?:^|\/)coverage\//,
+const BADGE_RULES: { slug: string; check: (s: Stats) => boolean }[] = [
+  { slug: "locked-in", check: (s) => s.streak >= 7 },
+  { slug: "agent-maxxer", check: (s) => s.agentLines >= 1000 },
+  { slug: "pr-goblin", check: (s) => s.totalPRs >= 10 },
+  { slug: "merge-addict", check: (s) => s.streak >= 5 },
+  { slug: "boilerplate-beast", check: (s) => s.avgAILikelihood > 0.7 },
+  { slug: "3am-goblin", check: (s) => s.hasLateNight },
+  { slug: "one-shot-killer", check: (s) => s.hasOneShotPR },
 ];
 
-function isGeneratedFile(filename: string): boolean {
-  return GENERATED_FILE_PATTERNS.some((pattern) => pattern.test(filename));
-}
-
-/** Process repos in batches to limit concurrency. */
-async function processInBatches<T, R>(
-  items: T[],
-  concurrency: number,
-  fn: (item: T) => Promise<R>
-): Promise<PromiseSettledResult<R>[]> {
-  const results: PromiseSettledResult<R>[] = [];
-
-  for (let i = 0; i < items.length; i += concurrency) {
-    const batch = items.slice(i, i + concurrency);
-    const batchResults = await Promise.allSettled(batch.map(fn));
-    results.push(...batchResults);
-  }
-
-  return results;
+interface Stats {
+  agentLines: number;
+  totalPRs: number;
+  streak: number;
+  avgAILikelihood: number;
+  hasLateNight: boolean;
+  hasOneShotPR: boolean;
 }
 
 export async function syncUser(userId: string) {
-  const user = await db.user.findUniqueOrThrow({
-    where: { id: userId },
-    select: {
-      id: true,
-      githubAccessToken: true,
-      githubUsername: true,
-      lastSyncedAt: true,
-    },
-  });
+  const { data: user, error: fetchError } = await supabase
+    .from("users")
+    .select("*")
+    .eq("id", userId)
+    .single();
 
-  if (!user.githubAccessToken) {
-    throw new Error(`User ${userId} has no GitHub access token`);
+  if (fetchError || !user?.access_token || !user?.username) {
+    throw new Error("User not found or missing token");
   }
 
-  if (!user.githubUsername) {
-    throw new Error(`User ${userId} has no GitHub username`);
-  }
+  const octokit = createGitHubClient(user.access_token);
+  const username = user.username;
 
-  const octokit = createGitHubClient(user.githubAccessToken);
+  const allRepos = await fetchUserRepos(octokit);
+  const repos = allRepos.slice(0, 20);
 
-  // Fetch and upsert repos
-  const repos = await fetchUserRepos(octokit, user.githubUsername);
-
-  for (const repo of repos) {
-    await db.repo.upsert({
-      where: { githubId: repo.id },
-      create: {
-        userId: user.id,
-        githubId: repo.id,
-        name: repo.name,
-        fullName: repo.full_name,
-        description: repo.description,
-        language: repo.language,
-        stars: repo.stargazers_count ?? 0,
-        isPrivate: repo.private,
-        defaultBranch: repo.default_branch ?? "main",
-      },
-      update: {
-        name: repo.name,
-        fullName: repo.full_name,
-        description: repo.description,
-        language: repo.language,
-        stars: repo.stargazers_count ?? 0,
-        isPrivate: repo.private,
-        defaultBranch: repo.default_branch ?? "main",
-      },
-    });
-  }
-
-  // Take the 20 most recently pushed repos
-  const recentRepos = repos
-    .sort(
-      (a, b) =>
-        new Date(b.pushed_at ?? 0).getTime() -
-        new Date(a.pushed_at ?? 0).getTime()
-    )
-    .slice(0, 20);
-
-  const since =
-    user.lastSyncedAt ?? new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-
+  let totalAdditions = 0;
+  let totalDeletions = 0;
   let totalPRs = 0;
   let totalFiles = 0;
-  let reposProcessed = 0;
-  let reposFailed = 0;
+  let hasLateNight = false;
+  let hasOneShotPR = false;
+  const mergeHours: number[] = [];
+  const repoPRCounts = new Map<string, number>();
 
-  const repoResults = await processInBatches(recentRepos, 3, async (repo) => {
-    const [owner, repoName] = repo.full_name.split("/");
+  const since = user.last_synced_at
+    ? new Date(user.last_synced_at)
+    : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
 
-    const dbRepo = await db.repo.findUnique({
-      where: { githubId: repo.id },
-    });
+  for (let i = 0; i < repos.length; i += 3) {
+    const batch = repos.slice(i, i + 3);
+    await Promise.allSettled(
+      batch.map(async (repo: any) => {
+        const [owner, repoName] = repo.full_name.split("/");
+        const prs = await fetchMergedPRs(octokit, owner, repoName, username, since);
 
-    if (!dbRepo) {
-      throw new Error(`Repo ${repo.full_name} not found in DB after upsert`);
-    }
+        for (const pr of prs) {
+          const prAny = pr as any;
+          totalAdditions += prAny.additions ?? 0;
+          totalDeletions += prAny.deletions ?? 0;
+          totalFiles += prAny.changed_files ?? 0;
+          totalPRs++;
 
-    const mergedPRs = await fetchMergedPRs(
-      octokit,
-      owner,
-      repoName,
-      user.githubUsername!,
-      since
+          if (pr.merged_at) {
+            const hour = new Date(pr.merged_at).getUTCHours();
+            mergeHours.push(hour);
+            if (hour >= 2 && hour <= 5) hasLateNight = true;
+          }
+          if ((prAny.commits ?? 0) === 1 && (prAny.additions ?? 0) > 200) hasOneShotPR = true;
+        }
+
+        if (prs.length > 0) repoPRCounts.set(repo.full_name, prs.length);
+      })
     );
-
-    let repoPRCount = 0;
-    let repoFileCount = 0;
-
-    for (const pr of mergedPRs) {
-      const [detail, files] = await Promise.all([
-        fetchPRDetail(octokit, owner, repoName, pr.number),
-        fetchPRFiles(octokit, owner, repoName, pr.number),
-      ]);
-
-      const dbPR = await db.pullRequest.upsert({
-        where: { githubId: pr.id },
-        create: {
-          repoId: dbRepo.id,
-          githubId: pr.id,
-          number: pr.number,
-          title: pr.title,
-          state: "merged",
-          mergedAt: pr.merged_at ? new Date(pr.merged_at) : null,
-          additions: detail.additions,
-          deletions: detail.deletions,
-          changedFiles: detail.changed_files,
-          commitCount: detail.commits,
-        },
-        update: {
-          title: pr.title,
-          state: "merged",
-          mergedAt: pr.merged_at ? new Date(pr.merged_at) : null,
-          additions: detail.additions,
-          deletions: detail.deletions,
-          changedFiles: detail.changed_files,
-          commitCount: detail.commits,
-        },
-      });
-
-      // Delete existing files for this PR and re-insert
-      await db.prFile.deleteMany({
-        where: { pullRequestId: dbPR.id },
-      });
-
-      if (files.length > 0) {
-        await db.prFile.createMany({
-          data: files.map((file) => ({
-            pullRequestId: dbPR.id,
-            filename: file.filename,
-            status: file.status ?? "modified",
-            additions: file.additions,
-            deletions: file.deletions,
-            patch: file.patch ?? null,
-            isGenerated: isGeneratedFile(file.filename),
-          })),
-        });
-      }
-
-      repoPRCount++;
-      repoFileCount += files.length;
-    }
-
-    return { repoPRCount, repoFileCount };
-  });
-
-  for (const result of repoResults) {
-    if (result.status === "fulfilled") {
-      reposProcessed++;
-      totalPRs += result.value.repoPRCount;
-      totalFiles += result.value.repoFileCount;
-    } else {
-      reposFailed++;
-      console.error("Failed to process repo:", result.reason);
-    }
   }
 
-  // Update lastSyncedAt
-  await db.user.update({
-    where: { id: userId },
-    data: { lastSyncedAt: new Date() },
-  });
+  // Output score (log-scaled, capped at 10)
+  const outputScore = Math.min(10,
+    Math.log10(1 + totalAdditions + totalDeletions * 0.5) +
+    Math.log10(1 + totalFiles) * 0.3
+  );
 
-  return {
-    reposFound: repos.length,
-    reposProcessed,
-    reposFailed,
-    totalPRs,
-    totalFiles,
+  // AI likelihood heuristic
+  let aiScore = 0.3;
+  if (totalPRs > 0) {
+    const avgAdd = totalAdditions / totalPRs;
+    if (avgAdd > 200) aiScore += 0.15;
+    if (avgAdd > 500) aiScore += 0.1;
+    if (hasOneShotPR) aiScore += 0.1;
+    if (totalFiles / Math.max(1, totalPRs) > 5) aiScore += 0.1;
+  }
+  aiScore = Math.min(0.95, Math.max(0.1, aiScore));
+
+  const vibeScore = Math.round(outputScore * (1 + aiScore * 1.5) * 100) / 100;
+
+  // Peak hour
+  const hourCounts = new Map<number, number>();
+  for (const h of mergeHours) hourCounts.set(h, (hourCounts.get(h) ?? 0) + 1);
+  let peakHour = "12:00 UTC";
+  let maxHourCount = 0;
+  for (const [h, c] of hourCounts) {
+    if (c > maxHourCount) { peakHour = `${h.toString().padStart(2, "0")}:00 UTC`; maxHourCount = c; }
+  }
+
+  // Top repo
+  let topRepo = user.top_repo;
+  let maxPRs = 0;
+  for (const [name, count] of repoPRCounts) {
+    if (count > maxPRs) { topRepo = name; maxPRs = count; }
+  }
+
+  const streak = Math.min(totalPRs, 30);
+  const newAgentLines = (user.agent_lines ?? 0) + totalAdditions;
+  const newTotalPRs = (user.total_prs ?? 0) + totalPRs;
+
+  const stats: Stats = {
+    agentLines: newAgentLines,
+    totalPRs: newTotalPRs,
+    streak,
+    avgAILikelihood: aiScore,
+    hasLateNight,
+    hasOneShotPR,
   };
+  const badges = BADGE_RULES.filter((b) => b.check(stats)).map((b) => b.slug);
+
+  const { error } = await supabase
+    .from("users")
+    .update({
+      agent_lines: newAgentLines,
+      vibe_hours: Math.round(newAgentLines / 150),
+      vibe_score: vibeScore,
+      streak,
+      total_prs: newTotalPRs,
+      peak_hour: peakHour,
+      top_repo: topRepo,
+      badges,
+      score_daily: vibeScore,
+      score_weekly: vibeScore * 3,
+      score_alltime: (user.score_alltime ?? 0) + vibeScore,
+      last_synced_at: new Date().toISOString(),
+    })
+    .eq("id", userId);
+
+  if (error) throw error;
+
+  return { totalPRs, totalAdditions, vibeScore, badges };
 }
